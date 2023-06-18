@@ -99,27 +99,36 @@ class FactScorer(object):
         logging.critical("Estimated OpenAI API cost for %s ($%.3f per 1000 tokens): $%.2f for %d words and %d tokens" % (task, rate, total_cost, total_words, total_tokens))
 
     def get_score(self,
-                  topics,
                   generations,
+                  topics=None,
                   atomic_facts=None,
                   knowledge_source=None,
-                  verbose=False):
+                  verbose=False,
+                  passages=None):
 
         if knowledge_source is None:
             # use the default one (enwiki-20230401)
             knowledge_source = "enwiki-20230401"
-            if knowledge_source not in self.retrieval:
+            if passages is None and knowledge_source not in self.retrieval:
                 self.register_knowledge_source(knowledge_source)
         else:
             assert knowledge_source in self.retrieval, \
                 f"{knowledge_source} is not registered yet. Please use `register_knowledge_source()` function to register it with a database"
 
-        if type(topics)==len(generations)==str:
-            topics = [topics]
+        if type(generations) == str:
             generations = [generations]
-        else:
-            assert type(topics)==type(generations)==list, "`topics` and `generations` should be lists."
-            assert len(topics)==len(generations), "`topics` and `generations` should have the same length"
+
+        if type(topics) == str:
+            topics = [topics]
+        elif topics is None:
+            assert passages is not None, "`passages` are required if `topics` are not provided"
+            topics = [None] * len(generations)
+
+        assert type(topics)==type(generations)==list, "`topics` and `generations` should be lists."
+        assert len(topics)==len(generations), "`topics` and `generations` should have the same length"
+
+        if passages is None:
+            passages = [None] * len(generations)
 
         if atomic_facts is not None:
             assert len(topics)==len(atomic_facts), "`topics` and `atomic_facts` should have the same length"
@@ -140,7 +149,7 @@ class FactScorer(object):
                 topics = tqdm(topics)
 
             atomic_facts = []
-            for topic, gen in zip(topics, generations):
+            for gen in generations:
                 curr_afs, _ = self.af_generator.run(gen)
                 curr_afs = [fact for _, facts in curr_afs for fact in facts]
                 if len(curr_afs)==0:
@@ -158,9 +167,9 @@ class FactScorer(object):
         if "ChatGPT" in self.model_name:
             # estimate the total cost of response generation
             total_words = 0
-            for topic, generation, facts in zip(topics, generations, atomic_facts):
+            for topic, generation, facts, psgs in zip(topics, generations, atomic_facts, passages):
                 if facts is not None:
-                    total_words += self._get_score(topic, generation, facts, knowledge_source, cost_estimate=self.cost_estimate)
+                    total_words += self._get_score(topic, generation, facts, knowledge_source, cost_estimate=self.cost_estimate, passages=psgs)
 
             self.print_cost_estimates(total_words, task="factscore evaluation", model="gpt-3.5-turbo")
 
@@ -168,36 +177,50 @@ class FactScorer(object):
             topics = tqdm(topics)
 
         scores = []
+        raw_scores = []
         decisions = []
-        for topic, generation, facts in zip(topics, generations, atomic_facts):
+        for topic, generation, facts, psgs in zip(topics, generations, atomic_facts, passages):
             if facts is None:
                 decisions.append(None)
+                raw_scores.append(None)
             else:
-                decision = self._get_score(topic, generation, facts, knowledge_source)
+                decision = self._get_score(topic, generation, facts, knowledge_source, passages=psgs)
                 score = np.mean([d["is_supported"] for d in decision])
                 decisions.append(decision)
                 scores.append(score)
+                raw_scores.append(score)
                 if len(scores) % 10 == 0:
                     self.save_cache()
 
         self.save_cache()
 
         return {"score": np.mean(scores),
+                "raw_scores": raw_scores,
                 "respond_ratio": respond_ratio,
                 "decisions": decisions,
                 "num_facts_per_response": np.mean([len(d) for d in decisions if d is not None])}
 
-    def _get_score(self, topic, generation, atomic_facts, knowledge_source, cost_estimate=None):
+    def _get_score(self, topic, generation, atomic_facts, knowledge_source, cost_estimate=None, passages=None):
         decisions = []
         total_words = 0
         for atom in atomic_facts:
             atom = atom.strip()
             if self.lm:
-                passages = self.retrieval[knowledge_source].get_passages(topic, atom, k=5)
-                definition = "Answer the question about {} based on the given context.\n\n".format(topic)
+                if passages is None:
+                    passages = self.retrieval[knowledge_source].get_passages(topic, atom, k=5)
+                if topic is not None:
+                    definition = "Answer the question about {} based on the given context.\n\n".format(topic)
+                else:
+                    definition = "Answer the question based on the given context.\n\n"
                 context = ""
                 for psg_idx, psg in enumerate(reversed(passages)):
-                    context += "Title: {}\nText: {}\n\n".format(psg["title"], psg["text"].replace("<s>", "").replace("</s>", ""))
+                    title = psg.get("title")
+                    text = psg["text"].replace("<s>", "").replace("</s>", "")
+                    if title is not None:
+                        context += "Title: {}\nText: {}\n\n".format(title, text)
+                    else:
+                        context += "Text: {}\n\n".format(text)
+
                 definition += context.strip()
                 if not definition[-1] in string.punctuation:
                     definition += "."
@@ -273,6 +296,10 @@ if __name__ == '__main__':
                         choices=["consider_cache", "ignore_cache"])
     parser.add_argument('--use_atomic_facts',
                         action="store_true")
+    parser.add_argument('--ignore_topics',
+                        action="store_true")
+    parser.add_argument('--use_passages',
+                        action="store_true")
     parser.add_argument('--verbose',
                         action="store_true",
                         help="for printing out the progress bar")
@@ -281,6 +308,9 @@ if __name__ == '__main__':
                         help="for printing out rate limit error when using OpenAI keys")
     parser.add_argument('--n_samples',
                         type=int,
+                        default=None)
+    parser.add_argument('--result_save_path',
+                        type=str,
                         default=None)
 
     args = parser.parse_args()
@@ -297,30 +327,40 @@ if __name__ == '__main__':
                     cost_estimate=args.cost_estimate)
 
     tot = 0
-    topics, generations, atomic_facts = [], [], []
+    topics, generations, atomic_facts, passages = [], [], [], []
     with open(args.input_path) as f:
         for line in f:
             dp = json.loads(line)
             tot += 1
+
+            generations.append(dp["output"])
+
             if args.use_atomic_facts:
                 assert "annotations" in dp, "You can specify `--use_atomic_facts` only when atomic facts are available in the input data already."
                 if dp["annotations"] is None:
                     continue
-                topics.append(dp["topic"])
-                generations.append(dp["output"])
                 atomic_facts.append([atom["text"] for sent in dp["annotations"] for atom in sent["model-atomic-facts"]])
-            else:
+
+            if not args.ignore_topics:
                 topics.append(dp["topic"])
-                generations.append(dp["output"])
+
+            if args.use_passages:
+                passages.append(dp["passages"])
+
             if args.n_samples is not None and tot==args.n_samples:
                 break
-    out = fs.get_score(topics=topics,
+    out = fs.get_score(topics=topics if not args.ignore_topics else None,
                        generations=generations,
                        atomic_facts=atomic_facts if args.use_atomic_facts else None,
+                       passages=passages if args.use_passages else None,
                        verbose=args.verbose)
     logging.critical("FActScore = %.1f%%" % (100*out["score"]))
     logging.critical("Respond ratio = %.1f%%" % (100*out["respond_ratio"]))
     logging.critical("# Atomic facts per valid response = %.1f" % (out["num_facts_per_response"]))
+
+    if args.result_save_path:
+        with open(args.result_save_path, 'w', encoding='utf8') as output:
+            json.dump(out, output)
 
 
 
